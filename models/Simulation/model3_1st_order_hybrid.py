@@ -1,7 +1,7 @@
 import pandas as pd
 import pickle
 
-from models.Structure_Learning import DBNStructureLearner
+from pgmpy_extensions.Structure_Learning import DBNStructureLearner
 
 variables = ["Volume", "Volatility", "Log_return", "Trend"]
 

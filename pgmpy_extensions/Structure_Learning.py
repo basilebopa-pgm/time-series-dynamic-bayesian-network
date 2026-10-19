@@ -3,7 +3,7 @@ import inspect
 from pgmpy.causal_discovery import HillClimbSearch, ExpertKnowledge
 
 
-from models.DLGBN import DynamicBayesianNetwork
+from pgmpy_extensions.DLGBN import DynamicBayesianNetwork
 
 
 class DBNStructureLearner:

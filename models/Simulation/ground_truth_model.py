@@ -1,4 +1,4 @@
-from models.DLGBN import DynamicBayesianNetwork
+from pgmpy_extensions.DLGBN import DynamicBayesianNetwork
 from pgmpy.factors.continuous import LinearGaussianCPD
 
 def create_ground_truth():

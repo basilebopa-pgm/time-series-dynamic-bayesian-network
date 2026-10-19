@@ -1,7 +1,7 @@
 import pandas as pd
 import pickle
 
-from models.Structure_Learning import DBNStructureLearner
+from pgmpy_extensions.Structure_Learning import DBNStructureLearner
 
 variables = [ "Seasonality", "Volume", "Volatility", "Log_return", "Trend"]
 
@@ -34,7 +34,6 @@ import networkx as nx
 G = nx.DiGraph(model2_1st_order_seasonal.edges())
 
 pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
-
 
 plt.figure(figsize=(8, 6))
 nx.draw(

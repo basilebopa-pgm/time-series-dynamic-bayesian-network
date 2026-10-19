@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pickle
 
-from models.ground_truth_model import create_ground_truth
+from models.Simulation.ground_truth_model import create_ground_truth
 from evaluation.structure_learning.structure_scoring import evaluate_structure
 
 

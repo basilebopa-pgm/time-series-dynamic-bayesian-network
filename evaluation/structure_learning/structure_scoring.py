@@ -3,12 +3,13 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 def normalize_edge(source, target):
     source_name, source_slice = source[0], source[1]
     target_name, target_slice = target[0], target[1]
+    lag = target_slice - source_slice
 
-    if source_slice == target_slice:
+    if lag == 0:
         return ("intra", source_name, target_name)
 
-    if source_slice == 0 and target_slice == 1:
-        return ("inter", source_name, target_name)
+    if lag > 0:
+        return ("inter", source_name, target_name, lag)
 
     raise ValueError(f"Unexpected DBN edge: {source} -> {target}")
 

@@ -1,148 +1,108 @@
+import networkx as nx
 import numpy as np
-import torch
-
-def gaussian_kl(mu_p, sigma_p, mu_q, sigma_q):
-    mu_p = np.asarray(mu_p, dtype=float)
-    sigma_p = np.asarray(sigma_p, dtype=float)
-    mu_q = np.asarray(mu_q, dtype=float)
-    sigma_q = np.asarray(sigma_q, dtype=float)
-
-    if np.any(sigma_p <= 0) or np.any(sigma_q <= 0):
-        raise ValueError("Standard deviations must be positive.")
-
-    return (np.log(sigma_q / sigma_p) + (sigma_p**2 + (mu_p - mu_q)**2) / (2 * sigma_q**2) - 0.5)
-
-def estimate_kl(log_prob_gt, log_prob_learned):
-
-    log_prob_gt = np.asarray(log_prob_gt)
-    log_prob_learned = np.asarray(log_prob_learned)
-
-    if log_prob_gt.shape != log_prob_learned.shape:
-        raise ValueError("Both arrays must have the same shape.")
-
-    if not np.all(np.isfinite(log_prob_gt)):
-        raise ValueError("Ground-truth log probabilities must be finite.")
-
-    if not np.all(np.isfinite(log_prob_learned)):
-        raise ValueError("Learned-model log probabilities must be finite.")
-
-    return np.mean(log_prob_gt - log_prob_learned)
-
-def mean_conditional_kl(true_means, true_variances, learned_means, learned_variances):
-    true_means = np.asarray(true_means, dtype=float)
-    learned_means = np.asarray(learned_means, dtype=float)
-
-    true_variances = np.asarray(true_variances, dtype=float)
-    learned_variances = np.asarray(learned_variances, dtype=float)
-
-    true_sigmas = np.sqrt(np.maximum(true_variances, 1e-8))
-    learned_sigmas = np.sqrt(np.maximum(learned_variances, 1e-8))
-
-    kl_values = gaussian_kl(true_means, true_sigmas,learned_means, learned_sigmas,)
-
-    return float(np.mean(kl_values))
-
-def get_linear_distribution(cpd, parent_values):
-    
-    beta = np.asarray(cpd.beta).reshape(-1)
-    values = np.asarray([parent_values[parent] for parent in cpd.evidence], dtype=float)
-    mean = beta[0] + np.dot(beta[1:], values)
-    variance = float(cpd.std) ** 2
-
-    return mean, variance
-
-def get_neural_distribution(cpd, parent_values):
-    
-    cpd.eval()
-    parents = torch.as_tensor(parent_values,dtype=next(cpd.parameters()).dtype)
-
-    with torch.no_grad():
-        mean, variance = cpd(parents)
-
-    return mean.cpu().numpy(), variance.cpu().numpy()
+from scipy.stats import multivariate_normal
 
 
+def _joint_gaussian(dbn, n_time_slices, order):
+    """
+    Mean and covariance of the unrolled linear Gaussian DBN, computed directly
+    from the CPDs (X_i = b0 + sum_j b_j * parent_j + noise), returned in `order`.
+    `order` may be a subset of the variables, which gives the marginal.
+    """
+    bn = dbn._unroll(n_time_slices)
+    cpds = {c.variable: c for c in bn.get_cpds()}
+    topo = list(nx.topological_sort(bn))
+    pos = {v: i for i, v in enumerate(topo)}
+    n = len(topo)
 
-def evaluate_parameters(ground_truth, learned_model, test_data):
+    mean = np.zeros(n)
+    cov = np.zeros((n, n))
 
-    gt_cpds = {cpd.variable: cpd for cpd in ground_truth.get_cpds()}
-    learned_cpds = {cpd.variable: cpd for cpd in learned_model.get_cpds()}
+    for v in topo:
+        i = pos[v]
+        c = cpds[v]
+        beta = np.asarray(c.beta, dtype=float).ravel()
+        parents = list(c.evidence or [])
+        w = beta[1:]
+        pidx = [pos[p] for p in parents]
 
-    per_variable_kl = {}
-    per_variable_rmse = {}
+        mean[i] = beta[0] + (w @ mean[pidx] if parents else 0.0)
 
-    shared_variables = (set(gt_cpds) & set(learned_cpds) & set(test_data.columns))
+        for k in range(i):
+            cov[i, k] = cov[k, i] = (w @ cov[pidx, k]) if parents else 0.0
 
-    for variable in sorted(shared_variables):
-        gt_cpd = gt_cpds[variable]
-        learned_cpd = learned_cpds[variable]
+        var_parents = (w @ cov[np.ix_(pidx, pidx)] @ w) if parents else 0.0
+        cov[i, i] = var_parents + float(c.std) ** 2
 
-        gt_parents = list(getattr(gt_cpd, "evidence", []) or [])
-        learned_parents = list(getattr(learned_cpd, "evidence", []) or [])
+    idx = [pos[v] for v in order]
+    return mean[idx], cov[np.ix_(idx, idx)]
 
-        if set(gt_parents) != set(learned_parents):
-            print(f"Skipping {variable}: parent sets differ.")
-            continue
 
-        if any(parent not in test_data.columns for parent in gt_parents):
-            print(f"Skipping {variable}: missing parent column.")
-            continue
+def _check_variables(gt, model):
+    """The model's variables must be a subset of the ground truth's."""
+    extra = set(model._nodes()) - set(gt._nodes())
+    if extra:
+        raise ValueError(f"Model has variables the ground truth lacks: {sorted(extra)}")
+    missing = sorted(set(gt._nodes()) - set(model._nodes()))
+    return missing
 
-        if not hasattr(gt_cpd, "beta") or not hasattr(gt_cpd, "std"):
-            raise TypeError(f"Ground-truth CPD for {variable} must expose beta and std.")
 
-        X = test_data[gt_parents].to_numpy(dtype=float)
-        beta = np.asarray(gt_cpd.beta, dtype=float).reshape(-1)
+def _gt_logp(gt, model, x, n_time_slices):
+    """
+    log p_gt(x) over the variables the model actually covers.
+    If the model omits some GT variables, this is the log-density of the GT
+    marginal over the model's variables (GT must be linear Gaussian).
+    """
+    missing = _check_variables(gt, model)
+    if not missing:
+        return gt.log_likelihood(x)
 
-        if len(beta) != len(gt_parents) + 1:
-            raise ValueError(f"Unexpected beta shape for {variable}.")
+    if gt.model_type != "linear":
+        raise NotImplementedError("Marginalising a neural ground truth is not supported.")
 
-        true_means = beta[0] + ( X @ beta[1:] if gt_parents else 0.0)
-        true_variances = np.full(len(test_data), float(gt_cpd.std) ** 2)
+    nodes = sorted(model._nodes())
+    cols = [(n, t) for t in range(n_time_slices) for n in nodes]
+    names = [f"{n}_{t}" for n, t in cols]
+    mean, cov = _joint_gaussian(gt, n_time_slices, names)
+    return multivariate_normal(mean, cov, allow_singular=True).logpdf(x[cols].to_numpy(dtype=float))
 
-        if hasattr(learned_cpd, "beta") and hasattr(learned_cpd, "std"):
-            learned_beta = np.asarray(learned_cpd.beta, dtype=float).reshape(-1)
 
-            X_learned = test_data[learned_parents].to_numpy(dtype=float)
+def kl_monte_carlo(gt, model, n_time_slices, n_samples=20000, seed=0):
+    """
+    Monte Carlo estimate of KL(GT || model) = E_{x~GT}[log p_gt(x) - log p_model(x)].
+    Returns (estimate, standard_error). Works for linear and neural models.
+    If the model omits GT variables, the KL is taken against the GT marginal
+    over the model's variables.
+    """
+    x = gt.simulate(n_samples=n_samples, n_time_slices=n_time_slices, seed=seed)
+    diff = _gt_logp(gt, model, x, n_time_slices) - model.log_likelihood(x)
+    return diff.mean(), diff.std() / np.sqrt(n_samples)
 
-            learned_means = learned_beta[0] + (X_learned @ learned_beta[1:]if learned_parents else 0.0)
-            learned_variances = np.full(len(test_data), float(learned_cpd.std) ** 2)
 
-        else:
-            parent_values = test_data[learned_parents].to_numpy(dtype=np.float32)
-            learned_means, learned_variances = get_neural_distribution( learned_cpd, parent_values)
-            learned_means = np.asarray(learned_means).reshape(-1)
-            learned_variances = np.asarray(learned_variances).reshape(-1)
+def kl_on_data(gt, model, data):
+    """
+    Same estimate, but using a held-out dataset sampled from the ground truth.
+    Returns (estimate, standard_error).
+    """
+    T = len(set(c[1] for c in data.columns))
+    diff = _gt_logp(gt, model, data, T) - model.log_likelihood(data)
+    return diff.mean(), diff.std() / np.sqrt(len(data))
 
-        per_variable_kl[variable] = mean_conditional_kl(true_means,true_variances,learned_means,learned_variances,)
 
-    variable_name = getattr(variable, "variable", variable)
-
-    if variable_name in test_data.columns:
-        observed = test_data[variable_name].to_numpy(dtype=float)
-
-        per_variable_rmse[variable] = float(
-            np.sqrt(np.mean((observed - learned_means) ** 2))
-        )
-
-    if not per_variable_kl:
-        raise ValueError(
-            "No compatible CPDs were evaluated. Check node names, "
-            "parent sets, and test-data columns."
-        )
-
-    print("Test-data columns:")
-    print(test_data.columns.tolist())
-
-    print("\nGround-truth CPD variables:")
-    print([cpd.variable for cpd in ground_truth.get_cpds()])
-
-    print("\nModel 1 CPD variables:")
-    print([cpd.variable for cpd in learned_model.get_cpds()])
-    return {
-        "Overall": {
-            "Mean Conditional KL": float(np.mean(list(per_variable_kl.values()))),
-            "RMSE": float(np.mean(list(per_variable_rmse.values()))),
-        },
-        "Per-variable KL": per_variable_kl,
-    }
+def kl_gaussian_exact(gt, model, n_time_slices):
+    """
+    Closed-form KL(GT || model) for linear Gaussian DBNs only.
+    If the model omits GT variables, uses the GT marginal over the model's variables.
+    """
+    _check_variables(gt, model)
+    nodes = sorted(model._nodes())
+    order = [f"{n}_{t}" for t in range(n_time_slices) for n in nodes]
+    mp, Sp = _joint_gaussian(gt, n_time_slices, order)
+    mq, Sq = _joint_gaussian(model, n_time_slices, order)
+    k = len(order)
+    d = mq - mp
+    Sq_inv = np.linalg.inv(Sq)
+    return 0.5 * (
+        np.trace(Sq_inv @ Sp) + d @ Sq_inv @ d - k
+        + np.linalg.slogdet(Sq)[1] - np.linalg.slogdet(Sp)[1]
+    )

@@ -8,6 +8,7 @@ import torch.nn as nn
 import networkx as nx
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.linear_model import LinearRegression
 
 from pgmpy_extensions.NeuralCPD import NeuralGaussianCPD
@@ -17,6 +18,7 @@ from pgmpy.base import DAG
 
 from pgmpy.factors.continuous import LinearGaussianCPD
 from pgmpy.models import LinearGaussianBayesianNetwork
+
 
 @dataclass(eq=True, frozen=True)
 class DynamicNode:
@@ -71,22 +73,29 @@ class DynamicNode:
         """
         return (self.node, self.time_slice)
 
-class DynamicBayesianNetwork(DAG):
-    def __init__(self, ebunch=None, model_type="linear"):
-        super().__init__()
 
+class DynamicBayesianNetwork(DAG):
+
+    def __init__(self, ebunch=None, model_type="linear", order=1):
+        
+        if not isinstance(order, int) or order < 1:
+            raise ValueError("order must be an integer >= 1.")
+        
         if model_type not in {"linear", "neural"}:
             raise ValueError("model_type must be 'linear' or 'neural'.")
-        
+ 
+        self.order = order 
+        DAG.__init__(self)
         self.model_type = model_type
-        
+        self.cpds = []
+ 
         if ebunch:
             self.add_edges_from(ebunch)
 
-        self.cpds = []
-
     def add_node(self, node, **attr):
-        super().add_node(DynamicNode(node, 0), **attr)
+        
+        for t in range(self.order + 1):
+            DAG.add_node(self, DynamicNode(node, t), **attr)
 
     def add_nodes_from(self, nodes, **attr):
         for node in nodes:
@@ -99,38 +108,41 @@ class DynamicBayesianNetwork(DAG):
         return list({timeslice for node, timeslice in super().nodes()})
 
     def add_edge(self, start, end, **kwargs):
+
         try:
             if len(start) != 2 or len(end) != 2:
                 raise ValueError("Nodes must be of type (node, time_slice).")
-            elif not isinstance(start[1], int) or not isinstance(end[1], int):
+            
+            if not isinstance(start[1], int) or not isinstance(end[1], int):
                 raise ValueError("Nodes must be of type (node, time_slice).")
-            elif start[1] == end[1]:
-                start = (start[0], 0)
-                end = (end[0], 0)
-            elif start[1] == end[1] - 1:
-                start = (start[0], 0)
-                end = (end[0], 1)
-            elif start[1] > end[1]:
-                raise NotImplementedError("Edges in backward direction are not allowed.")
-            elif start[1] != end[1]:
-                raise ValueError("Edges over multiple time slices is not currently supported")
+            
         except TypeError:
             raise ValueError("Nodes must be of type (node, time_slice).")
+ 
+        u, v = start[0], end[0]
+        lag = end[1] - start[1]
+        k = self.order
+ 
+        if lag < 0:
+            raise NotImplementedError("Edges in backward direction are not allowed.")
+        
+        if lag > k:
+            raise ValueError(f"Edge spans {lag} time slices but model order is {k}.")
+        
+        if lag == 0:
+            if u == v:
+                raise ValueError("Self Loops are not allowed")
+            
+            a, b = DynamicNode(u, k), DynamicNode(v, k)
 
-        start = DynamicNode(*start)
-        end = DynamicNode(*end)
-
-        if start == end:
-            raise ValueError("Self Loops are not allowed")
-        elif start in super().nodes() and end in super().nodes() and nx.has_path(self, end, start):
-            raise ValueError(f"Loops are not allowed. Adding the edge from ({str(start)} --> {str(end)}) forms a loop.")
-
-        super().add_edge(start, end, **kwargs)
-
-        if start[1] == end[1]:
-            super().add_edge(DynamicNode(start[0], 1 - start[1]), DynamicNode(end[0], 1 - end[1]))
-        else:
-            super().add_node(DynamicNode(end[0], 1 - end[1]))
+            if a in self and b in self and nx.has_path(self, b, a):
+                raise ValueError(f"Loops are not allowed. Adding the edge ({a} --> {b}) forms a loop.")
+ 
+        self.add_node(u)
+        self.add_node(v)
+ 
+        for t in range(lag, k + 1):
+            DAG.add_edge(self, DynamicNode(u, t - lag), DynamicNode(v, t), **kwargs)
 
     def add_edges_from(self, ebunch, **kwargs):
         for edge in ebunch:
@@ -146,7 +158,10 @@ class DynamicBayesianNetwork(DAG):
         ]
 
     def get_inter_edges(self):
-        return [edge for edge in self.edges() if edge[0][1] != edge[1][1]]
+
+        k = self.order
+        return [e for e in self.edges() if e[1][1] == k and e[0][1] < k]
+
 
     def get_interface_nodes(self, time_slice=0):
         return [DynamicNode(edge[time_slice][0], edge[time_slice][1]) for edge in self.get_inter_edges()]
@@ -283,261 +298,323 @@ class DynamicBayesianNetwork(DAG):
 
         return bn
 
-    def _fit_linear(self,data,estimator="mle",std_estimator="unbiased",):
+    
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _parents_at(self, node, s):
 
-        if not isinstance(data, pd.DataFrame):
-            raise ValueError(f"data must be a pandas dataframe. Got: {type(data)}")
+        """[(parent_name, lag), ...] of `node` in CPD-slice s (0..order), deterministic order."""
+        ps = [(p.node, s - p.time_slice) for p in self.predecessors(DynamicNode(node, s))]
 
-        if estimator.lower() != "mle":
-            raise ValueError("Only Maximum Likelihood Estimation is supported.")
+        return sorted(ps, key=lambda x: (x[1], str(x[0])))
+ 
+    def _cols(self, node, t):
 
-        if std_estimator not in {"mle", "unbiased"}:
-            raise ValueError("std_estimator must be one of {'mle', 'unbiased'}")
+        """Absolute data columns (name, time) that the CPD used for `node` at time t depends on."""
+        s = min(t, self.order)
+        cpd = self.get_cpds(node=DynamicNode(node, s))
 
-        if not all(isinstance(col, tuple) and len(col) == 2 for col in data.columns):
-            raise ValueError("Data column names must be of the form " "(variable, time_slice).")
+        if cpd is None:
+            raise ValueError(f"No CPD found for {node}.")
+        
+        return [(p[0], t - (s - p[1])) for p in cpd.evidence]
+ 
+    def _xy(self, data, node, s, parents, T):
 
-        time_slices = sorted(set(col[1] for col in data.columns))
+        """Training matrices for CPD-slice s. Template slice (s == order) pools all windows."""
+        windows = [s] if s < self.order else range(self.order, T)
+        X_parts, y_parts = [], []
 
-        if time_slices[0] != 0:
-            raise ValueError("Data time slices must start from 0.")
-
-        n_time_slices = len(time_slices)
-
-        if n_time_slices < 2:
-            raise ValueError("At least two time slices are required.")
-
-        variables = self._nodes()
-
-        initial_cpds = []
-
-        initial_edges = [
-            (u[0],v[0])
-            for u, v in self.get_intra_edges(0)
-        ]
-
-        initial_bn = LinearGaussianBayesianNetwork(initial_edges)
-        initial_bn.add_nodes_from(variables)
-        initial_df = data.loc[:,[(node, 0) for node in variables]].copy()
-        initial_df.columns = variables
-        initial_bn.fit(initial_df)
-
-        for cpd in initial_bn.get_cpds():
-
-            evidence = [DynamicNode(parent, 0) for parent in cpd.evidence]
-            initial_cpds.append(
-                LinearGaussianCPD(variable=DynamicNode(cpd.variable,0),
-                    beta=cpd.beta.copy(),
-                    std=cpd.std,
-                    evidence=evidence if evidence else [],
-                )
-            )
-
-        transition_rows = []
-
-        for t in range(n_time_slices - 1):
-
-            current = data.loc[:,[(node, t) for node in variables]].copy()
-
-            next_slice = data.loc[:,[(node, t + 1) for node in variables]].copy()
-
-            current.columns = [
-                f"{node}__0"
-                for node in variables
-            ]
-
-            next_slice.columns = [f"{node}__1" for node in variables]
-
-            transition_rows.append(pd.concat( [current, next_slice], axis=1))
-
-        transition_df = pd.concat(transition_rows, ignore_index=True)
-
-        transition_cpds = []
-
-        for node in variables:
-
-            intra_parents = [
-                u[0]
-                for u, v in self.get_intra_edges(0)
-                if v[0] == node
-            ]
-
-            inter_parents = [
-                u[0]
-                for u, v in self.get_inter_edges()
-                if v[0] == node
-            ]
-
-            current_columns = [f"{parent}__1" for parent in intra_parents]
-            previous_columns = [f"{parent}__0" for parent in inter_parents]
-            parents = (current_columns + previous_columns)
-
-            target_column = f"{node}__1"
-            y = transition_df[target_column]
+        for t in windows:
+            y_parts.append(data[(node, t)].to_numpy(dtype=float))
 
             if parents:
-
-                X = transition_df[parents]
-                regression = LinearRegression()
-                regression.fit(X, y)
-                residuals = (y - regression.predict(X))
-
-                if std_estimator == "mle":
-                    ddof = 0
-                else:
-                    ddof = 1 + len(parents)
-
-                std = residuals.std(ddof=ddof)
-                beta = np.concatenate([[regression.intercept_], regression.coef_,])
+                X_parts.append(np.column_stack([data[(p, t - lag)].to_numpy(dtype=float) for p, lag in parents]))
 
             else:
-                beta = np.array([y.mean()])
-                ddof = (0 if std_estimator == "mle" else 1)
-                std = y.std(ddof=ddof)
+                X_parts.append(np.empty((len(data), 0)))
 
-            evidence = []
+        return np.concatenate(X_parts, axis=0), np.concatenate(y_parts, axis=0)
+ 
+    def _check_frame(self, data):
 
-            for parent in intra_parents:
-                evidence.append(DynamicNode(parent,1))
-
-            for parent in inter_parents:
-                evidence.append( DynamicNode(parent, 0))
-
-            transition_cpds.append(
-                LinearGaussianCPD(
-                    variable=DynamicNode(node, 1),
-                    beta=beta,
-                    std=std,
-                    evidence=evidence if evidence else None,
-                )
-            )
-
-        self.cpds = []
-        self.add_cpds(*initial_cpds, *transition_cpds)
-        self.check_model()
-
-        return self
-
-    
-    def _fit_neural(self, data, hidden_dim=32, epochs=500, learning_rate=0.001, seed=None):
         if not isinstance(data, pd.DataFrame):
             raise ValueError(f"data must be a pandas dataframe. Got: {type(data)}")
-
-        if not all(isinstance(col, tuple) and len(col) == 2 for col in data.columns):
+        
+        if not all(isinstance(c, tuple) and len(c) == 2 for c in data.columns):
             raise ValueError("Data column names must be of the form (variable, time_slice).")
-
-        time_slices = sorted(set(col[1] for col in data.columns))
-
-        if not time_slices or time_slices[0] != 0 or time_slices != list(range(len(time_slices))):
+        
+        slices = sorted(set(c[1] for c in data.columns))
+        if slices != list(range(len(slices))):
             raise ValueError("Data time slices must be consecutive integers starting from 0.")
-
-        if len(time_slices) < 2:
-            raise ValueError("At least two time slices are required.")
-
+        
+        if len(slices) < self.order + 1:
+            raise ValueError(f"At least {self.order + 1} time slices are required for order {self.order}.")
+        
         variables = self._nodes()
-        required_columns = {(node, t) for node in variables for t in time_slices}
-        missing = required_columns - set(data.columns)
+        missing = {(n, t) for n in variables for t in slices} - set(data.columns)
 
         if missing:
             raise ValueError(f"Missing required data columns: {sorted(missing, key=str)}")
+        
+        return len(slices), variables
 
-        if not all(pd.api.types.is_numeric_dtype(data[col]) for col in required_columns):
+
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
+    def _fit_linear(self, data, estimator="mle", std_estimator="unbiased"):
+        if estimator.lower() != "mle":
+            raise ValueError("Only Maximum Likelihood Estimation is supported.")
+        if std_estimator not in {"mle", "unbiased"}:
+            raise ValueError("std_estimator must be one of {'mle', 'unbiased'}")
+ 
+        T, variables = self._check_frame(data)
+        cpds = []
+ 
+        for s in range(self.order + 1):
+            for node in variables:
+                parents = self._parents_at(node, s)
+                X, y = self._xy(data, node, s, parents, T)
+ 
+                if parents:
+                    reg = LinearRegression().fit(X, y)
+                    resid = y - reg.predict(X)
+                    ddof = 0 if std_estimator == "mle" else 1 + len(parents)
+                    beta = np.concatenate([[reg.intercept_], reg.coef_])
+                else:
+                    resid = y - y.mean()
+                    ddof = 0 if std_estimator == "mle" else 1
+                    beta = np.array([y.mean()])
+ 
+                std = np.sqrt((resid ** 2).sum() / (len(y) - ddof))
+                cpds.append(
+                    LinearGaussianCPD(
+                        variable=DynamicNode(node, s),
+                        beta=beta,
+                        std=std,
+                        evidence=[DynamicNode(p, s - lag) for p, lag in parents],
+                    )
+                )
+ 
+        self.cpds = []
+        self.add_cpds(*cpds)
+        self.check_model()
+        return self
+ 
+    def _fit_neural(self, data, hidden_dim=32, epochs=500, learning_rate=0.001, seed=None):
+        T, variables = self._check_frame(data)
+        cols = [(n, t) for n in variables for t in range(T)]
+        if not all(pd.api.types.is_numeric_dtype(data[c]) for c in cols):
             raise ValueError("All model data columns must be numeric.")
-
-        if not data.loc[:, list(required_columns)].notna().all().all():
-            raise ValueError("Training data must not contain missing values.")
-
-        if not np.isfinite(data.loc[:, list(required_columns)].to_numpy(dtype=float)).all():
+        if not np.isfinite(data.loc[:, cols].to_numpy(dtype=float)).all():
             raise ValueError("Training data must contain only finite values.")
-
         if epochs < 1 or learning_rate <= 0:
             raise ValueError("epochs must be positive and learning_rate must be greater than zero.")
-
         if seed is not None:
             torch.manual_seed(seed)
             np.random.seed(seed)
-
-        device = torch.device("cpu")
-
+ 
         def train_cpd(variable, evidence, X, y):
-            X = torch.as_tensor(X, dtype=torch.float32, device=device)
-            y = torch.as_tensor(y, dtype=torch.float32, device=device).reshape(-1)
-
+            X = torch.as_tensor(X, dtype=torch.float32)
+            y = torch.as_tensor(y, dtype=torch.float32).reshape(-1)
             if len(y) < 2:
                 raise ValueError(f"At least two observations are required to fit {variable}.")
-
-            cpd = NeuralGaussianCPD(variable=variable, evidence=evidence if evidence else None, hidden_dim=hidden_dim).to(device)
-            optimizer = torch.optim.Adam(cpd.parameters(), lr=learning_rate)
+            cpd = NeuralGaussianCPD(variable=variable, evidence=evidence if evidence else None, hidden_dim=hidden_dim)
+            opt = torch.optim.Adam(cpd.parameters(), lr=learning_rate)
             cpd.train()
-
             for _ in range(epochs):
-                optimizer.zero_grad()
+                opt.zero_grad()
                 loss = -cpd.log_prob(y, X).mean()
-
                 if not torch.isfinite(loss):
                     raise ValueError(f"Non-finite training loss for {variable}.")
-
                 loss.backward()
-                optimizer.step()
-
+                opt.step()
             cpd.eval()
             return cpd
-
-        initial_cpds = []
-        transition_cpds = []
-        intra_edges = self.get_intra_edges(0)
-        inter_edges = self.get_inter_edges()
-
-        # Fit initial-slice CPDs: P(X(0)).
-        for node in variables:
-            parents = [u[0] for u, v in intra_edges if v[0] == node]
-            evidence = [DynamicNode(parent, 0) for parent in parents]
-            X = data.loc[:, [(parent, 0) for parent in parents]].to_numpy(dtype=np.float32) if parents else np.empty((len(data), 0), dtype=np.float32)
-            y = data[(node, 0)].to_numpy(dtype=np.float32)
-            initial_cpds.append(train_cpd(DynamicNode(node, 0), evidence, X, y))
-
-        # Pool all adjacent transitions.
-        transition_data = []
-
-        for t in range(len(time_slices) - 1):
-            current = data.loc[:, [(node, t) for node in variables]].copy()
-            next_slice = data.loc[:, [(node, t + 1) for node in variables]].copy()
-            transition_data.append((t, current, next_slice))
-
-        # Fit transition CPDs: P(X(t+1) | parents).
-        for node in variables:
-            intra_parents = [u[0] for u, v in intra_edges if v[0] == node]
-            inter_parents = [u[0] for u, v in inter_edges if v[0] == node]
-            evidence = [DynamicNode(parent, 1) for parent in intra_parents] + [DynamicNode(parent, 0) for parent in inter_parents]
-            X_parts = []
-            y_parts = []
-
-            for t, current, next_slice in transition_data:
-                parent_values = [next_slice[(parent, t + 1)].to_numpy(dtype=np.float32) for parent in intra_parents]
-                parent_values += [current[(parent, t)].to_numpy(dtype=np.float32) for parent in inter_parents]
-                X_parts.append(np.column_stack(parent_values) if parent_values else np.empty((len(current), 0), dtype=np.float32))
-                y_parts.append(next_slice[(node, t + 1)].to_numpy(dtype=np.float32))
-
-            X = np.concatenate(X_parts, axis=0)
-            y = np.concatenate(y_parts, axis=0)
-            transition_cpds.append(train_cpd(DynamicNode(node, 1), evidence, X, y))
-
+ 
+        cpds = []
+        for s in range(self.order + 1):
+            for node in variables:
+                parents = self._parents_at(node, s)
+                X, y = self._xy(data, node, s, parents, T)
+                evidence = [DynamicNode(p, s - lag) for p, lag in parents]
+                cpds.append(train_cpd(DynamicNode(node, s), evidence, X, y))
+ 
         self.cpds = []
-        self.add_cpds(*initial_cpds, *transition_cpds)
+        self.add_cpds(*cpds)
         self.check_model()
-
         return self
 
-
-    def fit(self,data,estimator="mle",std_estimator="unbiased",**kwargs,):
+    def fit(self, data, estimator="mle", std_estimator="unbiased", **kwargs,):
 
         if self.model_type == "linear":
-            return self._fit_linear(data,estimator=estimator,std_estimator=std_estimator,**kwargs,)
+            return self._fit_linear(data, estimator=estimator, std_estimator=std_estimator, **kwargs,)
 
-        return self._fit_neural(data,**kwargs,)
+        return self._fit_neural(data, **kwargs,)
+ 
+    # ------------------------------------------------------------------
+    # Unrolling (linear only)
+    # ------------------------------------------------------------------
+    def _unroll(self, n_time_slices):
+        if not self.cpds:
+            raise ValueError("Model must be fitted before unrolling.")
+ 
+        nodes = self._nodes()
+        edges, unrolled = [], []
+ 
+        for t in range(n_time_slices):
+            for node in nodes:
+                s = min(t, self.order)
+                src = self.get_cpds(node=DynamicNode(node, s))
+                ev = [f"{n}_{tt}" for n, tt in self._cols(node, t)]
+                edges.extend((e, f"{node}_{t}") for e in ev)
+                unrolled.append(
+                    LinearGaussianCPD(
+                        variable=f"{node}_{t}",
+                        beta=src.beta.copy(),
+                        std=src.std,
+                        evidence=ev,
+                    )
+                )
+ 
+        bn = LinearGaussianBayesianNetwork(edges)
+        bn.add_nodes_from([f"{n}_{t}" for t in range(n_time_slices) for n in nodes])
+        bn.add_cpds(*unrolled)
+        bn.check_model()
+        return bn
+ 
 
+    # ------------------------------------------------------------------
+    # Log-likelihood (linear and neural)
+    # ------------------------------------------------------------------
+    def log_likelihood(self, data):
+        """
+        Per-row log p(x_0, ..., x_{T-1}) under the DBN.
+        Data columns must be (node, time_slice).
+        """
+        T = len(set(c[1] for c in data.columns))
+        total = np.zeros(len(data))
 
-    def simulate(self,n_samples=10,n_time_slices=2,seed=None,return_format="wide",):
+        for t in range(T):
+            for node in self._nodes():
+                cpd = self.get_cpds(node=DynamicNode(node, min(t, self.order)))
+
+                if cpd is None:
+                    raise ValueError(f"No CPD found for {node}.")
+
+                # Map CPD parents to the columns they refer to at time t
+                cols = self._cols(node, t)
+                y = data[(node, t)].to_numpy(dtype=float)
+
+                if self.model_type == "linear":
+                    mean = np.full(len(data), float(cpd.beta[0]), dtype=float)
+                    if cols:
+                        mean += data[cols].to_numpy(dtype=float) @ np.asarray(cpd.beta[1:], dtype=float)
+                    total += norm.logpdf(y, loc=mean, scale=float(cpd.std))
+                else:
+                    X = torch.as_tensor(
+                        data[cols].to_numpy(dtype=np.float32) if cols
+                        else np.empty((len(data), 0), dtype=np.float32)
+                    )
+                    with torch.no_grad():
+                        lp = cpd.log_prob(torch.as_tensor(y, dtype=torch.float32), X)
+                    total += lp.numpy().astype(float)
+
+        return total
+
+    # ------------------------------------------------------------------
+    # Ancestral sampler for neural DBNs
+    # ------------------------------------------------------------------
+    def _simulate_neural(self, n_samples, n_time_slices, seed=None):
+        gen = torch.Generator().manual_seed(0 if seed is None else int(seed))
+        slice0 = self.subgraph([DynamicNode(n, 0) for n in self._nodes()])
+        order = [v.node for v in nx.topological_sort(slice0)]
+        out = {}
+
+        with torch.no_grad():
+            for t in range(n_time_slices):
+                for node in order:
+                    cpd = self.get_cpds(node=DynamicNode(node, min(t, self.order)))
+                    cols = self._cols(node, t)
+                    X = (
+                        torch.stack([out[c] for c in cols], dim=1) if cols
+                        else torch.empty((n_samples, 0))
+                    )
+                    mean, var = cpd(X)
+                    out[(node, t)] = mean + var.sqrt() * torch.randn(n_samples, generator=gen)
+
+        sampled = pd.DataFrame({k: v.numpy() for k, v in out.items()})
+        sampled.columns = pd.MultiIndex.from_tuples(list(sampled.columns))
+        return sampled
+
+    # ------------------------------------------------------------------
+    # Conditional forecasting (linear and neural CPDs)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cpd_mean_std(cpd, parents, shape):
+        """Mean array and std (array or float) of a CPD given parent value arrays."""
+        if isinstance(cpd, NeuralGaussianCPD):
+            n = int(np.prod(shape))
+            if parents:
+                X = np.stack([p.reshape(-1) for p in parents], axis=1).astype(np.float32)
+            else:
+                X = np.empty((n, 0), dtype=np.float32)
+            with torch.no_grad():
+                mean, var = cpd(torch.as_tensor(X))
+            mean = mean.numpy().astype(float).reshape(shape)
+            std = np.sqrt(var.numpy().astype(float)).reshape(shape)
+            return mean, std
+
+        beta = np.asarray(cpd.beta, dtype=float).ravel()
+        mean = np.full(shape, beta[0])
+        for w, p in zip(beta[1:], parents):
+            mean = mean + w * p
+        return mean, float(cpd.std)
+
+    def forecast(self, history, n_steps, n_samples=200, seed=None):
+        """
+        Sample the future given observed history.
+
+        history : DataFrame with columns (node, t) for t = 0..k-1 (k >= 1).
+        Returns (samples, variables) where samples has shape
+        (n_rows, n_samples, n_steps, n_variables): slice k+h, variable j.
+        """
+        rng = np.random.default_rng(seed)
+        k = len(set(c[1] for c in history.columns))
+        if k < self.order:
+            raise ValueError(f"history needs at least {self.order} time slices for order {self.order}.")
+
+        N = len(history)
+        shape = (N, n_samples)
+        nodes = sorted(self._nodes())
+
+        g = nx.DiGraph()
+        g.add_nodes_from(nodes)
+        g.add_edges_from((u[0], v[0]) for u, v in self.get_intra_edges(0))
+        order = list(nx.topological_sort(g))
+
+        state = {
+            (n, t): np.repeat(history[(n, t)].to_numpy(dtype=float)[:, None], n_samples, axis=1)
+            for n in nodes for t in range(k)
+        }
+
+        for h in range(n_steps):
+            t = k + h
+            for node in order:
+                cpd = self.get_cpds(node=DynamicNode(node, self.order))
+                cols = self._cols(node, t)
+                mean, std = self._cpd_mean_std(cpd, [state[c] for c in cols], shape)
+                state[(node, t)] = mean + std * rng.standard_normal(shape)
+
+        out = np.stack(
+            [np.stack([state[(n, k + h)] for n in nodes], axis=-1) for h in range(n_steps)],
+            axis=2,
+        )  # (N, S, n_steps, d)
+        return out, nodes
+
+    def simulate(self, n_samples=10, n_time_slices=2, seed=None, return_format="wide",):
 
         if n_time_slices < 1:
             raise ValueError("n_time_slices must be >= 1.")
@@ -545,139 +622,24 @@ class DynamicBayesianNetwork(DAG):
         if not self.cpds:
             raise ValueError("Model must be fitted before simulation.")
 
-        edges = []
+        if any(isinstance(c, NeuralGaussianCPD) for c in self.cpds):
+            sampled = self._simulate_neural(n_samples, n_time_slices, seed)
+        else:
+            bn = self._unroll(n_time_slices)
 
-        for t in range(n_time_slices):
-
-            # Intra-slice edges
-            for u, v in self.get_intra_edges(0):
-
-                edges.append(
-                    (
-                        f"{u[0]}_{t}",
-                        f"{v[0]}_{t}",
-                    )
-                )
-
-        # Inter-slice edges
-        for t in range(n_time_slices - 1):
-
-            for u, v in self.get_inter_edges():
-
-                edges.append(
-                    (
-                        f"{u[0]}_{t}",
-                        f"{v[0]}_{t + 1}",
-                    )
-                )
-
-        # ---------------------------------------------------------
-        # Create static LGBN
-        # ---------------------------------------------------------
-
-        bn = LinearGaussianBayesianNetwork(
-            edges
-        )
-
-        all_nodes = [
-            f"{node}_{t}"
-            for t in range(n_time_slices)
-            for node in self._nodes()
-        ]
-
-        bn.add_nodes_from(all_nodes)
-
-        # ---------------------------------------------------------
-        # Replicate CPDs
-        # ---------------------------------------------------------
-
-        unrolled_cpds = []
-
-        for t in range(n_time_slices):
-
-            for node in self._nodes():
-
-                # t = 0 uses initial CPD
-                if t == 0:
-
-                    source_cpd = self.get_cpds(
-                        node=DynamicNode(node, 0)
-                    )
-
-                # t > 0 uses transition CPD
-                else:
-
-                    source_cpd = self.get_cpds(
-                        node=DynamicNode(node, 1)
-                    )
-
-                if source_cpd is None:
-                    raise ValueError(
-                        f"No CPD found for {node}."
-                    )
-
-                variable = (
-                    f"{node}_{t}"
-                )
-
-                evidence = []
-
-                for parent in source_cpd.evidence:
-
-                    if t == 0:
-                        # Initial CPDs: all parents are in slice 0
-                        parent_name = f"{parent[0]}_0"
-
-                    elif parent[1] == 0:
-                        # Transition CPD: time-0 parent means previous slice
-                        parent_name = f"{parent[0]}_{t - 1}"
-
-                    else:
-                        # Transition CPD: time-1 parent means current slice
-                        parent_name = f"{parent[0]}_{t}"
-
-                    evidence.append(parent_name)
-
-                unrolled_cpds.append(
-                    LinearGaussianCPD(
-                        variable=variable,
-                        beta=source_cpd.beta.copy(),
-                        std=source_cpd.std,
-                        evidence=evidence,
-                    )
-                )
-
-        bn.add_cpds(
-            *unrolled_cpds
-        )
-
-        bn.check_model()
-
-        # ---------------------------------------------------------
-        # Sample
-        # ---------------------------------------------------------
-
-        sampled = bn.simulate(
-            n_samples=n_samples,
-            seed=seed,
-        )
-
-        # ---------------------------------------------------------
-        # Convert columns back to
-        # (variable, time_slice)
-        # ---------------------------------------------------------
-
-        sampled.columns = [
-            (
-                column.rsplit("_", 1)[0],
-                int(column.rsplit("_", 1)[1]),
+            sampled = bn.simulate(
+                n_samples=n_samples,
+                seed=seed,
             )
-            for column in sampled.columns
-        ]
 
-        # ---------------------------------------------------------
-        # Return format
-        # ---------------------------------------------------------
+            # Convert columns back to (variable, time_slice)
+            sampled.columns = [
+                (
+                    column.rsplit("_", 1)[0],
+                    int(column.rsplit("_", 1)[1]),
+                )
+                for column in sampled.columns
+            ]
 
         if return_format == "wide":
             return sampled
@@ -690,14 +652,10 @@ class DynamicBayesianNetwork(DAG):
 
                 for time in range(n_time_slices):
 
-                    observation = {
-                        "time": time
-                    }
+                    observation = {"time": time}
 
                     for node in self._nodes():
-                        observation[node] = row[
-                            (node, time)
-                        ]
+                        observation[node] = row[(node, time)]
 
                     rows.append(observation)
 

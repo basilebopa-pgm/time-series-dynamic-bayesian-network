@@ -14,12 +14,15 @@ def load_pickle(path):
 
 ground_truth = create_ground_truth()
 
-model1_dag = load_pickle("models/Simulation/model1_1st_order_trained.pkl")
+model1_1st_order_dag = load_pickle("models/Simulation/model1_1st_order_trained.pkl")
+model1_2nd_order_dag = load_pickle("models/Simulation/model1_2nd_order_trained.pkl")
+
 model2_dag = load_pickle("models/Simulation/model2_1st_order_seasonal_trained.pkl")
 model3_dag = load_pickle("models/Simulation/model3_1st_order_hybrid_trained.pkl")
 
 
-results_model1 = evaluate_structure(ground_truth, model1_dag, "Model 1 - Random")
+results_model1_1st_order = evaluate_structure(ground_truth, model1_1st_order_dag, "Model 1 - Random")
+results_model1_2nd_order = evaluate_structure(ground_truth, model1_2nd_order_dag, "Model 1 - Random")
 
 results_model2 = evaluate_structure(ground_truth, model2_dag, "Model 2 - Seasonality")
 
@@ -27,9 +30,9 @@ results_model3 = evaluate_structure(ground_truth, model3_dag, "Model 3 - Hybrid"
 
 
 model_results = {
-    "Model 1 - Random": results_model1,
+    "Model 1 1nd order - Random": results_model1_1st_order,
+    "Model 1 2nd order - Random": results_model1_2nd_order,
     "Model 2 - Seasonality": results_model2,
-    "Model 3 - Hybrid": results_model3,
 }
 
 

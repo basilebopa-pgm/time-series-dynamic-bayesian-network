@@ -1,7 +1,7 @@
 import pandas as pd
 
 def load_data():
-    return pd.read_pickle("data/Simulation/ground_truth_data.pkl")
+    return pd.read_pickle("data/Simulation/GT_data.pkl")
 
 
 def split_data(data):

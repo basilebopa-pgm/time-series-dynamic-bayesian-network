@@ -1,5 +1,6 @@
 import pandas as pd
 import inspect
+import networkx as nx
 from pgmpy.causal_discovery import HillClimbSearch, ExpertKnowledge
 
 
@@ -11,7 +12,7 @@ class DBNStructureLearner:
     def __init__(
         self,
         variables,
-        markov_order=1,
+        order=1,
         scoring_method="bic-g",
         max_indegree=None,
         max_iter=10000,
@@ -20,11 +21,11 @@ class DBNStructureLearner:
         show_progress=True,
     ):
 
-        if markov_order < 1:
-            raise ValueError("markov_order must be >= 1.")
+        if order < 1:
+            raise ValueError("order must be >= 1.")
 
         self.variables = variables
-        self.markov_order = markov_order
+        self.order = order
         self.scoring_method = scoring_method
         self.max_indegree = max_indegree
         self.max_iter = max_iter
@@ -49,16 +50,16 @@ class DBNStructureLearner:
             set(column[1] for column in data.columns)
         )
 
-        if len(time_slices) <= self.markov_order:
+        if len(time_slices) <= self.order:
             raise ValueError(
-                f"At least {self.markov_order + 1} time slices "
+                f"At least {self.order + 1} time slices "
                 "are required."
             )
 
         rows = []
 
         for t in range(
-            self.markov_order,
+            self.order,
             len(time_slices)
         ):
 
@@ -74,7 +75,7 @@ class DBNStructureLearner:
                     f"{variable}_0"
                 ] = data[column].values
 
-            for lag in range(1, self.markov_order + 1):
+            for lag in range(1, self.order + 1):
 
                 previous_time = time_slices[t - lag]
 
@@ -104,7 +105,7 @@ class DBNStructureLearner:
 
         for lag in range(
             0,
-            self.markov_order + 1
+            self.order + 1
         ):
             for variable in self.variables:
 
@@ -152,6 +153,48 @@ class DBNStructureLearner:
         return ExpertKnowledge(
             forbidden_edges=forbidden_edges
         )
+
+    @staticmethod
+    def _parse(node):
+        v, l = node.rsplit("_", 1)
+        return v, int(l)
+
+    def _split_edges(self, G):
+        all_edges = set(G.edges())
+        mutual = {frozenset(e) for e in all_edges if (e[1], e[0]) in all_edges}
+
+        intra, inter = [], []
+
+        # 1) directed edges
+        for p, c in all_edges:
+            if frozenset((p, c)) in mutual:
+                continue
+            (pv, pl), (cv, cl) = self._parse(p), self._parse(c)
+            if pl == 0 and cl == 0:
+                intra.append((pv, cv))
+            elif pl > 0 and cl == 0:
+                inter.append((pv, cv, pl))
+
+        # 2) undirected edges: orient lagged ones by time, intra ones acyclically
+        g = nx.DiGraph()
+        g.add_nodes_from(self.variables)
+        g.add_edges_from(intra)
+
+        for pair in sorted(mutual, key=lambda s: sorted(s)):
+            a, b = sorted(pair)
+            (av, al), (bv, bl) = self._parse(a), self._parse(b)
+
+            if al == 0 and bl == 0:
+                if nx.has_path(g, bv, av):
+                    av, bv = bv, av
+                g.add_edge(av, bv)
+                intra.append((av, bv))
+            elif al > 0 and bl == 0:
+                inter.append((av, bv, al))      # past -> present
+            elif bl > 0 and al == 0:
+                inter.append((bv, av, bl))
+
+        return intra, inter
 
     def DynamicHillClimbing(self, data):
 
@@ -223,44 +266,35 @@ class DBNStructureLearner:
                     )
                 )
 
-        return {
-            "graph": learned_graph.causal_graph_,
-            "intra_edges": intra_edges,
-            "inter_edges": inter_edges,
-        }
+        intra_edges, inter_edges = self._split_edges(learned_graph.causal_graph_)
+        return {"graph": learned_graph.causal_graph_, "intra_edges": intra_edges, "inter_edges": inter_edges}
 
-    def build_dbn(self, result):
+    def build_dbn(self, result, model_type="linear", order=None):
 
-        if self.markov_order != 1:
+        inter_edges = result["inter_edges"]
 
+        learned_order = max(
+            (lag for _, _, lag in inter_edges),
+            default=1,
+        )
+
+        order = max(1, learned_order if order is None else order)
+
+        if order < learned_order:
             raise ValueError(
-                "The current DynamicBayesianNetwork class "
-                "only supports Markov order 1. "
-                "Structure learning for higher orders is "
-                "supported, but DLGBN.py must first be "
-                "extended to represent higher-order edges."
+                f"order={order} is smaller than the largest learned lag "
+                f"({learned_order})."
             )
 
-        dbn = DynamicBayesianNetwork()
+        dbn = DynamicBayesianNetwork(model_type=model_type, order=order)
 
         for variable in self.variables:
-            dbn.add_node(variable)
+            dbn.add_node(variable)         
 
-        for parent, child in result["intra_edges"]:
+        for parent, child in set(result["intra_edges"]):
+            dbn.add_edge((parent, 0), (child, 0))
 
-            dbn.add_edge(
-                (parent, 0),
-                (child, 0)
-            )
-
-        for parent, child, lag in result["inter_edges"]:
-
-            if lag != 1:
-                continue
-
-            dbn.add_edge(
-                (parent, 0),
-                (child, 1)
-            )
+        for parent, child, lag in set(inter_edges):
+            dbn.add_edge((parent, 0), (child, lag))
 
         return dbn
